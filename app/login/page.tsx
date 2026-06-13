@@ -27,6 +27,15 @@ export default function LoginPage() {
     setLoading(false)
   }
 
+  async function signInAnonymously() {
+    setLoading(true)
+    setError('')
+    const { error } = await supabase.auth.signInAnonymously()
+    if (error) setError(error.message)
+    else router.push('/dashboard')
+    setLoading(false)
+  }
+
   return (
     <div className="min-h-screen bg-black flex items-center justify-center p-4">
       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 w-full max-w-sm">
@@ -58,6 +67,15 @@ export default function LoginPage() {
         >
           {loading ? 'Please wait...' : isSignUp ? 'Sign up' : 'Log in'}
         </button>
+
+        <button
+          onClick={signInAnonymously}
+          disabled={loading}
+          className="w-full bg-zinc-700 hover:bg-zinc-600 text-white rounded-lg py-3 text-sm font-medium transition-colors disabled:opacity-50 mt-3"
+        >
+          Continue as Guest
+        </button>
+
         <p className="text-zinc-400 text-sm text-center mt-4">
           {isSignUp ? 'Already have an account?' : "Don't have an account?"}{' '}
           <button onClick={() => setIsSignUp(!isSignUp)} className="text-purple-400 hover:underline">
