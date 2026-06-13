@@ -53,7 +53,7 @@ function GymContent() {
     const { data: { user } } = await supabase.auth.getUser()
     await supabase.from('workout_logs').insert({ user_id: user!.id, logged_date: date, exercises })
     if (habitId) {
-      await supabase.from('habit_logs').insert({ habit_id: habitId, logged_date: date, user_id: user!.id }).onConflict('habit_id,logged_date').ignore()
+      await supabase.from('habit_logs').insert({ habit_id: habitId, logged_date: date, user_id: user!.id })
     }
     setSaving(false)
     router.push('/habits')
