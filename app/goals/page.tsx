@@ -1,6 +1,8 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { createClient } from '@/lib/supabase'
+import { auth, db } from '@/lib/firebase'
+import { onAuthStateChanged } from 'firebase/auth'
+import { collection, query, where, orderBy, getDocs, addDoc, updateDoc, deleteDoc, doc } from 'firebase/firestore'
 import { useRouter } from 'next/navigation'
 import { PageContainer } from '../../components/navigation'
 
@@ -38,36 +40,46 @@ export default function GoalsPage() {
   const [targetDate, setTargetDate] = useState('')
   const [saving, setSaving] = useState(false)
   const [filter, setFilter] = useState('active')
+  const [uid, setUid] = useState<string | null>(null)
   const router = useRouter()
-  const supabase = createClient()
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      if (!user) { router.push('/login'); return }
+      setUid(user.uid)
+      load(user.uid)
+    })
+    return () => unsub()
+  }, [])
 
-  async function load() {
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) { router.push('/login'); return }
-    const { data } = await supabase.from('goals').select('*').order('created_at', { ascending: false })
-    setGoals(data || [])
+  async function load(userId: string) {
+    const snap = await getDocs(
+      query(collection(db, 'goals'), where('user_id', '==', userId), orderBy('created_at', 'desc'))
+    )
+    setGoals(snap.docs.map(d => ({ id: d.id, ...d.data() } as Goal)))
     setLoading(false)
   }
 
   async function saveGoal() {
-    if (!title.trim()) return
+    if (!title.trim() || !uid) return
     setSaving(true)
-    const { data: { user } } = await supabase.auth.getUser()
-    await supabase.from('goals').insert({ user_id: user!.id, title: title.trim(), description, category, target_date: targetDate || null, status: 'active' })
+    await addDoc(collection(db, 'goals'), {
+      user_id: uid, title: title.trim(), description,
+      category, target_date: targetDate || null,
+      status: 'active', created_at: new Date().toISOString()
+    })
     setTitle(''); setDescription(''); setTargetDate(''); setShowForm(false)
-    setSaving(false); load()
+    setSaving(false); load(uid)
   }
 
   async function updateStatus(id: string, status: string) {
-    await supabase.from('goals').update({ status }).eq('id', id)
-    load()
+    await updateDoc(doc(db, 'goals', id), { status })
+    if (uid) load(uid)
   }
 
   async function deleteGoal(id: string) {
-    await supabase.from('goals').delete().eq('id', id)
-    load()
+    await deleteDoc(doc(db, 'goals', id))
+    if (uid) load(uid)
   }
 
   function useTemplate(t: typeof GOAL_TEMPLATES[0]) {
@@ -78,15 +90,13 @@ export default function GoalsPage() {
   const catConfig = (id: string) => GOAL_CATEGORIES.find(c => c.id === id) || GOAL_CATEGORIES[0]
   const daysLeft = (date: string) => {
     if (!date) return null
-    const diff = Math.ceil((new Date(date).getTime() - Date.now()) / 86400000)
-    return diff
+    return Math.ceil((new Date(date).getTime() - Date.now()) / 86400000)
   }
 
   if (loading) return <PageContainer title="🎯 My Goals"><div className="text-center py-10"><div className="w-8 h-8 rounded-full border-2 border-purple-500 border-t-transparent animate-spin mx-auto"/></div></PageContainer>
 
   return (
     <PageContainer title="🎯 My Goals" subtitle={`${goals.filter(g=>g.status==='active').length} active`}>
-      {/* New goal form */}
       {showForm && (
         <div className="rounded-3xl p-5 mb-5" style={{background:'rgba(124,58,237,0.08)',border:'1px solid rgba(124,58,237,0.2)'}}>
           <p className="text-white font-bold mb-4">New Goal</p>
@@ -110,7 +120,6 @@ export default function GoalsPage() {
         </div>
       )}
 
-      {/* Templates */}
       {!showForm && goals.length === 0 && (
         <div className="mb-5">
           <p className="text-zinc-500 text-xs uppercase tracking-widest mb-3">Start with a template</p>
@@ -129,7 +138,6 @@ export default function GoalsPage() {
         </div>
       )}
 
-      {/* Filter tabs */}
       {goals.length > 0 && (
         <div className="flex gap-2 mb-4">
           {['active','completed','all'].map(f=>(
@@ -140,7 +148,6 @@ export default function GoalsPage() {
         </div>
       )}
 
-      {/* Goals list */}
       <div className="flex flex-col gap-3">
         {filtered.map(g=>{
           const cat = catConfig(g.category)
@@ -181,7 +188,6 @@ export default function GoalsPage() {
         )}
       </div>
 
-      {/* Add button */}
       {!showForm && (
         <button onClick={()=>setShowForm(true)} className="w-full mt-5 py-4 rounded-2xl text-sm font-bold text-white" style={{background:'linear-gradient(135deg,#7C3AED,#4f46e5)',boxShadow:'0 6px 24px rgba(124,58,237,0.3)'}}>
           + Create New Goal

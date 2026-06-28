@@ -1,6 +1,8 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { createClient } from '@/lib/supabase'
+import { auth, db } from '@/lib/firebase'
+import { onAuthStateChanged } from 'firebase/auth'
+import { collection, query, where, orderBy, limit, getDocs } from 'firebase/firestore'
 import { useRouter } from 'next/navigation'
 import { PageContainer } from '../../components/navigation'
 
@@ -14,25 +16,28 @@ export default function GymHistoryPage() {
   const [activeTab, setActiveTab] = useState<'history'|'prs'|'volume'>('history')
   const [expandedWorkout, setExpandedWorkout] = useState<string|null>(null)
   const router = useRouter()
-  const supabase = createClient()
 
-  useEffect(()=>{load()},[])
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      if (!user) { router.push('/login'); return }
+      load(user.uid)
+    })
+    return () => unsub()
+  }, [])
 
-  async function load() {
-    const {data:{user}} = await supabase.auth.getUser()
-    if(!user){router.push('/login');return}
-    const [{data:prData},{data:wData}] = await Promise.all([
-      supabase.from('personal_records').select('*').order('logged_date',{ascending:false}),
-      supabase.from('workout_logs').select('*').order('logged_date',{ascending:false}).limit(20),
+  async function load(uid: string) {
+    const [prSnap, wSnap] = await Promise.all([
+      getDocs(query(collection(db, 'personal_records'), where('user_id', '==', uid), orderBy('logged_date', 'desc'))),
+      getDocs(query(collection(db, 'workout_logs'), where('user_id', '==', uid), orderBy('logged_date', 'desc'), limit(20))),
     ])
-    setPrs(prData||[])
-    setWorkouts(wData||[])
+    setPrs(prSnap.docs.map(d => ({ id: d.id, ...d.data() } as PR)))
+    setWorkouts(wSnap.docs.map(d => ({ id: d.id, ...d.data() } as WorkoutLog)))
     setLoading(false)
   }
 
   const bestPRs: Record<string,PR> = {}
   prs.forEach(pr => {
-    if(!bestPRs[pr.exercise] || (pr.weight_kg > bestPRs[pr.exercise].weight_kg)) {
+    if (!bestPRs[pr.exercise] || pr.weight_kg > bestPRs[pr.exercise].weight_kg) {
       bestPRs[pr.exercise] = pr
     }
   })
@@ -40,27 +45,23 @@ export default function GymHistoryPage() {
   const volumeByMuscle: Record<string,number> = {}
   workouts.slice(0,7).forEach(w => {
     (w.exercises||[]).forEach((ex:any) => {
-      const totalVol = (ex.sets||[]).reduce((a:number,s:any)=>{
-        return a + ((+s.weight||0) * (+s.reps||0))
-      },0)
+      const totalVol = (ex.sets||[]).reduce((a:number,s:any) => a + ((+s.weight||0) * (+s.reps||0)), 0)
       volumeByMuscle[ex.name] = (volumeByMuscle[ex.name]||0) + totalVol
     })
   })
 
   const totalWorkouts = workouts.length
   const totalPRs = Object.keys(bestPRs).length
-  const lastWorkout = workouts[0]
 
-  if(loading) return <PageContainer title="🏋️ Gym Tracker" subtitle={`${totalWorkouts} sessions`}><div className="text-center py-10"><div className="w-8 h-8 rounded-full border-2 border-orange-500 border-t-transparent animate-spin mx-auto"/></div></PageContainer>
+  if (loading) return <PageContainer title="🏋️ Gym Tracker" subtitle="Loading..."><div className="text-center py-10"><div className="w-8 h-8 rounded-full border-2 border-orange-500 border-t-transparent animate-spin mx-auto"/></div></PageContainer>
 
   return (
     <PageContainer title="🏋️ Gym Tracker" subtitle={`${totalWorkouts} sessions · ${totalPRs} PRs`}>
-      {/* Stats */}
       <div className="grid grid-cols-3 gap-3 mb-5">
         {[
-          {label:'Sessions',val:String(totalWorkouts),color:'#f97316'},
-          {label:'PRs set',val:String(totalPRs),color:'#eab308'},
-          {label:'This week',val:String(workouts.filter(w=>new Date(w.logged_date)>=new Date(Date.now()-7*86400000)).length),color:'#10b981'},
+          {label:'Sessions', val:String(totalWorkouts), color:'#f97316'},
+          {label:'PRs set', val:String(totalPRs), color:'#eab308'},
+          {label:'This week', val:String(workouts.filter(w=>new Date(w.logged_date)>=new Date(Date.now()-7*86400000)).length), color:'#10b981'},
         ].map((s,i)=>(
           <div key={i} className="rounded-2xl p-3 text-center" style={{background:`${s.color}12`,border:`1px solid ${s.color}30`}}>
             <p className="text-xl font-bold" style={{color:s.color}}>{s.val}</p>
@@ -69,7 +70,6 @@ export default function GymHistoryPage() {
         ))}
       </div>
 
-      {/* Tabs */}
       <div className="flex gap-2 mb-5">
         {(['history','prs','volume'] as const).map(t=>(
           <button key={t} onClick={()=>setActiveTab(t)} className="flex-1 py-2.5 rounded-xl text-xs font-semibold capitalize transition-all" style={activeTab===t?{background:'linear-gradient(135deg,#f97316,#dc2626)',color:'white'}:{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)',color:'rgba(255,255,255,0.4)'}}>
@@ -78,7 +78,6 @@ export default function GymHistoryPage() {
         ))}
       </div>
 
-      {/* History tab */}
       {activeTab==='history' && (
         <div className="flex flex-col gap-3">
           {workouts.length===0 && (
@@ -130,7 +129,6 @@ export default function GymHistoryPage() {
         </div>
       )}
 
-      {/* PRs tab */}
       {activeTab==='prs' && (
         <div className="flex flex-col gap-3">
           {Object.keys(bestPRs).length===0 && (
@@ -167,7 +165,6 @@ export default function GymHistoryPage() {
         </div>
       )}
 
-      {/* Volume tab */}
       {activeTab==='volume' && (
         <div>
           <p className="text-zinc-500 text-xs uppercase tracking-widest mb-3">Volume by exercise (last 7 sessions)</p>

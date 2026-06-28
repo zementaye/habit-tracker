@@ -1,6 +1,7 @@
 'use client'
 import { useState } from 'react'
-import { createClient } from '@/lib/supabase'
+import { auth, db } from '@/lib/firebase'
+import { collection, addDoc } from 'firebase/firestore'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Suspense } from 'react'
 
@@ -28,7 +29,6 @@ function GymContent() {
   const [exercises, setExercises] = useState<Exercise[]>([])
   const [saving, setSaving] = useState(false)
   const router = useRouter()
-  const supabase = createClient()
 
   function addExercise(name: string) {
     if (exercises.find(e => e.name === name)) return
@@ -50,10 +50,16 @@ function GymContent() {
   async function saveWorkout() {
     if (exercises.length === 0) return
     setSaving(true)
-    const { data: { user } } = await supabase.auth.getUser()
-    await supabase.from('workout_logs').insert({ user_id: user!.id, logged_date: date, exercises })
+    const uid = auth.currentUser?.uid
+    if (!uid) { router.push('/login'); return }
+    await addDoc(collection(db, 'workout_logs'), {
+      user_id: uid, logged_date: date, exercises,
+      created_at: new Date().toISOString()
+    })
     if (habitId) {
-      await supabase.from('habit_logs').insert({ habit_id: habitId, logged_date: date, user_id: user!.id })
+      await addDoc(collection(db, 'habit_logs'), {
+        habit_id: habitId, logged_date: date, user_id: uid
+      })
     }
     setSaving(false)
     router.push('/habits')
@@ -72,7 +78,6 @@ function GymContent() {
           </div>
         </div>
 
-        {/* Muscle group selector */}
         <p className="text-zinc-500 text-xs uppercase tracking-widest mb-3">Select muscle group</p>
         <div className="flex flex-wrap gap-2 mb-5">
           {MUSCLE_GROUPS.map(g => (
@@ -83,7 +88,6 @@ function GymContent() {
           ))}
         </div>
 
-        {/* Exercise picker */}
         <p className="text-zinc-500 text-xs uppercase tracking-widest mb-3">Add exercises</p>
         <div className="flex flex-wrap gap-2 mb-6">
           {EXERCISES[selectedGroup].map(ex => {
@@ -97,10 +101,10 @@ function GymContent() {
           })}
         </div>
 
-        {/* Exercise logs */}
         {exercises.length === 0 && (
           <div className="text-center py-10 text-zinc-600 text-sm">Select a muscle group and add exercises above</div>
         )}
+
         <div className="flex flex-col gap-4 mb-6">
           {exercises.map((exercise, eIdx) => (
             <div key={exercise.name} className="bg-zinc-900/80 border border-zinc-800 rounded-2xl p-4">
@@ -114,10 +118,10 @@ function GymContent() {
               {exercise.sets.map((set, sIdx) => (
                 <div key={sIdx} className="grid grid-cols-3 gap-2 mb-2 items-center">
                   <span className="text-zinc-500 text-sm pl-1">{sIdx + 1}</span>
-                  <input value={set.weight} onChange={e => updateSet(eIdx, sIdx, 'weight', e.target.value)}
+                  <input defaultValue={set.weight} onBlur={e => updateSet(eIdx, sIdx, 'weight', e.target.value)}
                     placeholder="0" type="number"
                     className="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-orange-500 text-center" />
-                  <input value={set.reps} onChange={e => updateSet(eIdx, sIdx, 'reps', e.target.value)}
+                  <input defaultValue={set.reps} onBlur={e => updateSet(eIdx, sIdx, 'reps', e.target.value)}
                     placeholder="0" type="number"
                     className="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-orange-500 text-center" />
                 </div>
@@ -129,7 +133,7 @@ function GymContent() {
 
         {exercises.length > 0 && (
           <button onClick={saveWorkout} disabled={saving}
-            className="w-full bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-400 hover:to-red-400 text-white py-4 rounded-2xl font-semibold text-sm transition-all disabled:opacity-50">
+            className="w-full bg-gradient-to-r from-orange-500 to-red-500 text-white py-4 rounded-2xl font-semibold text-sm transition-all disabled:opacity-50">
             {saving ? 'Saving...' : '💪 Save Workout'}
           </button>
         )}

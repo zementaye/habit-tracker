@@ -1,6 +1,7 @@
 'use client'
 import { useState, useEffect, Suspense } from 'react'
-import { createClient } from '@/lib/supabase'
+import { auth, db } from '@/lib/firebase'
+import { collection, query, where, orderBy, getDocs, addDoc, updateDoc, doc } from 'firebase/firestore'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { PageContainer } from '@/components/navigation'
 
@@ -16,46 +17,57 @@ function TodayRoutineContent() {
   const [completions, setCompletions] = useState<Record<string, Completion>>({})
   const [loading, setLoading] = useState(true)
   const router = useRouter()
-  const supabase = createClient()
   const today = new Date().toISOString().slice(0, 10)
 
   useEffect(() => { load() }, [routineId])
 
   async function load() {
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) { router.push('/login'); return }
+    const uid = auth.currentUser?.uid
+    if (!uid) { router.push('/login'); return }
 
-    const { data: routineData } = await supabase.from('daily_routines').select('*').eq('id', routineId).single()
-    setRoutine(routineData)
+    const routineSnap = await getDocs(
+      query(collection(db, 'daily_routines'), where('id', '==', routineId))
+    )
+    if (!routineSnap.empty) {
+      setRoutine({ id: routineSnap.docs[0].id, ...routineSnap.docs[0].data() } as Routine)
+    }
 
-    const { data: taskData } = await supabase.from('routine_tasks').select('*').eq('routine_id', routineId).order('scheduled_time')
-    setTasks(taskData || [])
+    const taskSnap = await getDocs(
+      query(collection(db, 'routine_tasks'), where('routine_id', '==', routineId), orderBy('scheduled_time'))
+    )
+    const taskData: Task[] = taskSnap.docs.map(d => ({ id: d.id, ...d.data() } as Task))
+    setTasks(taskData)
 
-    const { data: completionData } = await supabase.from('routine_completions').select('*').eq('routine_id', routineId).eq('completed_date', today)
+    const completionSnap = await getDocs(
+      query(collection(db, 'routine_completions'), where('routine_id', '==', routineId), where('completed_date', '==', today))
+    )
     const completionMap: Record<string, Completion> = {}
-    ;(completionData || []).forEach((c: any) => { completionMap[c.task_id] = c })
+    completionSnap.docs.forEach(d => {
+      const comp = d.data()
+      completionMap[comp.task_id] = { id: d.id, ...comp } as Completion
+    })
     setCompletions(completionMap)
-
     setLoading(false)
   }
 
   async function toggleTask(taskId: string) {
-    const { data: { user } } = await supabase.auth.getUser()
+    const uid = auth.currentUser?.uid
+    if (!uid) return
+    
     const completion = completions[taskId]
     if (completion) {
-      if (completion.completed) {
-        await supabase.from('routine_completions').update({ completed: false, completed_time: null }).eq('id', completion.id)
-      } else {
-        await supabase.from('routine_completions').update({ completed: true, completed_time: new Date().toISOString() }).eq('id', completion.id)
-      }
+      await updateDoc(doc(db, 'routine_completions', completion.id), {
+        completed: !completion.completed,
+        completed_time: !completion.completed ? new Date().toISOString() : null
+      })
     } else {
-      await supabase.from('routine_completions').insert({
+      await addDoc(collection(db, 'routine_completions'), {
         routine_id: routineId,
         task_id: taskId,
         completed_date: today,
         completed: true,
         completed_time: new Date().toISOString(),
-        user_id: user!.id,
+        user_id: uid,
       })
     }
     load()
@@ -94,7 +106,7 @@ function TodayRoutineContent() {
               background: isCompleted ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.03)',
               border: isCompleted ? '1px solid rgba(16,185,129,0.3)' : '1px solid rgba(255,255,255,0.07)',
             }}>
-              <div className="w-12 h-12 rounded-xl flex items-center justify-center text-lg flex-shrink-0" style={{background:isCompleted?'rgba(16,185,129,0.2)':'rgba(255,255,255,0.05)',border:isCompleted?'2px solid rgba(16,185,129,0.5)':'1px solid rgba(255,255,255,0.1)'}}>
+              <div className="w-12 h-12 rounded-xl flex items-center justify-center text-lg shrink-0" style={{background:isCompleted?'rgba(16,185,129,0.2)':'rgba(255,255,255,0.05)',border:isCompleted?'2px solid rgba(16,185,129,0.5)':'1px solid rgba(255,255,255,0.1)'}}>
                 {isCompleted ? '✓' : task.icon}
               </div>
               <div className="flex-1 text-left">
