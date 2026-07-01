@@ -32,7 +32,7 @@ export default function SettingsPage() {
     ]},
     { title: '👥 Community & Data', items: [
         { icon: '🏆', label: 'Leaderboard', path: '/leaderboard', desc: 'Share your scores' },
-        { icon: '💾', label: 'Export Data', path: '/export', desc: 'Download your data' },
+        { icon: '💾', label: 'Export Data', path: '/export-data', desc: 'Download your data' },
     ]},
     { title: '⚙️ App Settings', items: [
         { icon: '🔔', label: 'Notifications', path: '/notifications', desc: 'Reminders & alerts' },
