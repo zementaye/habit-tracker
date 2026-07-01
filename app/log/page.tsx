@@ -1,6 +1,7 @@
 'use client'
 import { useState, useEffect, Suspense } from 'react'
-import { createClient } from '@/lib/supabase'
+import { auth, db } from '@/lib/firebase'
+import { collection, query, where, orderBy, getDocs, addDoc, setDoc, doc, limit } from 'firebase/firestore'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { PageContainer } from '@/components/navigation'
 
@@ -125,7 +126,6 @@ function LogContent() {
   const [gratitude,setGratitude] = useState('')
 
   const router = useRouter()
-  const supabase = createClient()
 
   const sportKey = name.toLowerCase().includes('tennis')?'tennis':name.toLowerCase().includes('basket')?'basketball':name.toLowerCase().includes('box')||name.toLowerCase().includes('mma')?'boxing':name.toLowerCase().includes('football')||name.toLowerCase().includes('soccer')?'football':'default'
   const missingOptions = SPORT_MISSING[sportKey]||SPORT_MISSING.default
@@ -136,17 +136,22 @@ function LogContent() {
   },[type])
 
   async function loadLastSessions() {
-    const {data:{user}} = await supabase.auth.getUser()
-    if(!user) return
-    const {data} = await supabase.from('personal_records').select('*').eq('user_id',user.id)
-    if(!data) return
-    const map: Record<string,LastSession> = {}
-    data.forEach((pr:any)=>{
-      if(!map[pr.exercise]||pr.weight_kg>map[pr.exercise].bestWeight) {
-        map[pr.exercise]={exercise:pr.exercise,bestWeight:pr.weight_kg,bestReps:pr.reps}
-      }
-    })
-    setLastSessions(map)
+    const uid = auth.currentUser?.uid
+    if(!uid) return
+    try {
+      const q = query(collection(db, 'personal_records'), where('user_id', '==', uid), orderBy('logged_date', 'desc'))
+      const snap = await getDocs(q)
+      const map: Record<string,LastSession> = {}
+      snap.docs.forEach((d)=>{
+        const pr = d.data()
+        if(!map[pr.exercise]||pr.weight_kg>map[pr.exercise].bestWeight) {
+          map[pr.exercise]={exercise:pr.exercise,bestWeight:pr.weight_kg,bestReps:pr.reps}
+        }
+      })
+      setLastSessions(map)
+    } catch(e) {
+      console.error('Error loading last sessions:', e)
+    }
   }
 
   function addExercise(n:string){
@@ -166,11 +171,11 @@ function LogContent() {
   }
   function removeEx(i:number){setExercises(p=>p.filter((_,j)=>j!==i))}
   function toggleMissing(x:string){
-    const updated = missing.includes(x)?missing.filter(i=>i!==x):[...x,...missing,x].filter((v,i,a)=>a.indexOf(v)===i)
     setMissing(missing.includes(x)?missing.filter(i=>i!==x):[...missing,x])
     // Generate drills for selected weaknesses
     const sportDrills = SPORT_DRILLS[sportKey]||{}
-    const drills = (missing.includes(x)?missing.filter(i=>i!==x):[...missing,x])
+    const updated = missing.includes(x)?missing.filter(i=>i!==x):[...missing,x]
+    const drills = updated
       .filter(m=>sportDrills[m])
       .map(m=>({area:m,drills:sportDrills[m]}))
     setSuggestedDrills(drills)
@@ -181,38 +186,74 @@ function LogContent() {
 
   async function save() {
     setSaving(true)
-    const {data:{user}} = await supabase.auth.getUser()
-    await supabase.from('habit_logs').upsert({habit_id:habitId,logged_date:date,user_id:user!.id,note:notes,performance:type==='sport'?performance:null})
+    const uid = auth.currentUser?.uid
+    if(!uid) {
+      alert('Not logged in')
+      setSaving(false)
+      return
+    }
 
-    if(type==='gym' && exercises.length>0) {
-      await supabase.from('workout_logs').insert({user_id:user!.id,logged_date:date,exercises})
-      // Save PRs
-      for(const ex of exercises) {
-        const bestSet = ex.sets.reduce((best:any,s)=>{
-          return (!best||+s.weight>+best.weight)?s:best
-        },null)
-        if(bestSet && +bestSet.weight>0) {
-          const last = lastSessions[ex.name]
-          if(!last || +bestSet.weight >= last.bestWeight) {
-            await supabase.from('personal_records').insert({
-              user_id:user!.id,exercise:ex.name,weight_kg:+bestSet.weight,
-              reps:+bestSet.reps||0,logged_date:date,rpe
-            })
+    try {
+      // Save habit log
+      await setDoc(doc(db, 'habit_logs', `${uid}_${date}`), {
+        habit_id: habitId,
+        logged_date: date,
+        user_id: uid,
+        note: notes,
+        performance: type==='sport'?performance:null,
+        created_at: new Date()
+      }, { merge: true })
+
+      if(type==='gym' && exercises.length>0) {
+        // Save workout log
+        await addDoc(collection(db, 'workout_logs'), {
+          user_id: uid,
+          logged_date: date,
+          exercises,
+          created_at: new Date()
+        })
+        // Save PRs
+        for(const ex of exercises) {
+          const bestSet = ex.sets.reduce((best:any,s)=>{
+            return (!best||+s.weight>+best.weight)?s:best
+          },null)
+          if(bestSet && +bestSet.weight>0) {
+            const last = lastSessions[ex.name]
+            if(!last || +bestSet.weight >= last.bestWeight) {
+              await addDoc(collection(db, 'personal_records'), {
+                user_id: uid,
+                exercise: ex.name,
+                weight_kg: +bestSet.weight,
+                reps: +bestSet.reps||0,
+                logged_date: date,
+                rpe,
+                created_at: new Date()
+              })
+            }
           }
         }
       }
-    }
 
-    if(type==='sport') {
-      await supabase.from('sport_logs').insert({
-        user_id:user!.id,sport:name,logged_date:date,
-        performance,what_went_well:wentWell,
-        what_was_missing:missing.join(', '),notes
-      })
-    }
+      if(type==='sport') {
+        await addDoc(collection(db, 'sport_logs'), {
+          user_id: uid,
+          sport: name,
+          logged_date: date,
+          performance,
+          what_went_well: wentWell,
+          what_was_missing: missing.join(', '),
+          notes,
+          created_at: new Date()
+        })
+      }
 
-    setSaving(false)
-    router.push('/habits')
+      setSaving(false)
+      router.push('/habits')
+    } catch(e) {
+      console.error('Error saving:', e)
+      alert('Error saving. Check console.')
+      setSaving(false)
+    }
   }
 
   const Card = ({children,className=''}:{children:React.ReactNode,className?:string})=>(
@@ -230,321 +271,319 @@ function LogContent() {
 
   return (
     <PageContainer title="📝 Log Entry" subtitle="New entry">
-      {/* JUST your content goes here — no wrapper divs, no manual header, no back button */}
-   
-    <div className="min-h-screen pb-10" style={{background:'linear-gradient(160deg,#07071a 0%,#0e0920 50%,#070d18 100%)'}}>
-      <div className="max-w-lg mx-auto px-4">
-        <div className="flex items-center gap-3 pt-8 pb-5">
-          <button onClick={()=>router.back()} className="w-9 h-9 rounded-xl flex items-center justify-center text-zinc-400 hover:text-white" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)'}}>
-            <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
-          </button>
-          <div>
-            <h1 className="text-xl font-bold text-white">{cfg.icon} {name}</h1>
-            <p className="text-zinc-500 text-xs">{new Date(date+'T00:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})}</p>
-          </div>
-        </div>
-
-        {/* New PR alert */}
-        {newPRs.length>0 && (
-          <div className="rounded-2xl p-4 mb-4 text-center" style={{background:'linear-gradient(135deg,rgba(234,179,8,0.15),rgba(245,158,11,0.08))',border:'1px solid rgba(234,179,8,0.3)'}}>
-            <p className="text-2xl mb-1">🏆</p>
-            <p className="text-yellow-400 font-bold text-sm">New Personal Record!</p>
-            <p className="text-zinc-300 text-xs mt-1">{newPRs.join(', ')}</p>
-          </div>
-        )}
-
-        {/* GYM */}
-        {type==='gym' && <>
-          <Card>
-            <Label>Muscle group</Label>
-            <div className="flex flex-wrap gap-2 mb-4">
-              {MUSCLE_GROUPS.map(g=><Pill key={g} label={g} active={muscleGroup===g} onClick={()=>setMuscleGroup(g)}/>)}
+      <div className="min-h-screen pb-10" style={{background:'linear-gradient(160deg,#07071a 0%,#0e0920 50%,#070d18 100%)'}}>
+        <div className="max-w-lg mx-auto px-4">
+          <div className="flex items-center gap-3 pt-8 pb-5">
+            <button onClick={()=>router.back()} className="w-9 h-9 rounded-xl flex items-center justify-center text-zinc-400 hover:text-white" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)'}}>
+              <svg width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+            </button>
+            <div>
+              <h1 className="text-xl font-bold text-white">{cfg.icon} {name}</h1>
+              <p className="text-zinc-500 text-xs">{new Date(date+'T00:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})}</p>
             </div>
-            <Label>Select exercises</Label>
-            <div className="flex flex-wrap gap-2">
-              {EXERCISES[muscleGroup].map(ex=>{
-                const added = !!exercises.find(e=>e.name===ex)
-                const hasLast = !!lastSessions[ex]
-                return (
-                  <button key={ex} onClick={()=>addExercise(ex)} className="px-3 py-1.5 rounded-xl text-xs font-medium transition-all border" style={added?{background:`${cfg.accent}22`,borderColor:`${cfg.accent}55`,color:cfg.accent}:{background:'rgba(255,255,255,0.03)',borderColor:'rgba(255,255,255,0.08)',color:hasLast?'rgba(255,255,255,0.7)':'rgba(255,255,255,0.4)'}}>
-                    {added?'✓ ':''}{ex}{hasLast?` (PR: ${lastSessions[ex].bestWeight}kg)`:''}
-                  </button>
-                )
-              })}
-            </div>
-          </Card>
+          </div>
 
-          {exercises.map((ex,ei)=>{
-            const last = lastSessions[ex.name]
-            const isPR = newPRs.includes(ex.name)
-            return (
-              <Card key={ex.name}>
-                <div className="flex justify-between mb-2">
-                  <div>
-                    <p className="font-bold text-white text-sm">{ex.name}</p>
-                    {last && <p className="text-xs mt-0.5" style={{color:cfg.accent}}>Previous best: {last.bestWeight}kg × {last.bestReps} reps — beat it!</p>}
-                    {isPR && <p className="text-yellow-400 text-xs">🏆 New PR this session!</p>}
+          {/* New PR alert */}
+          {newPRs.length>0 && (
+            <div className="rounded-2xl p-4 mb-4 text-center" style={{background:'linear-gradient(135deg,rgba(234,179,8,0.15),rgba(245,158,11,0.08))',border:'1px solid rgba(234,179,8,0.3)'}}>
+              <p className="text-2xl mb-1">🏆</p>
+              <p className="text-yellow-400 font-bold text-sm">New Personal Record!</p>
+              <p className="text-zinc-300 text-xs mt-1">{newPRs.join(', ')}</p>
+            </div>
+          )}
+
+          {/* GYM */}
+          {type==='gym' && <>
+            <Card>
+              <Label>Muscle group</Label>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {MUSCLE_GROUPS.map(g=><Pill key={g} label={g} active={muscleGroup===g} onClick={()=>setMuscleGroup(g)}/>)}
+              </div>
+              <Label>Select exercises</Label>
+              <div className="flex flex-wrap gap-2">
+                {EXERCISES[muscleGroup].map(ex=>{
+                  const added = !!exercises.find(e=>e.name===ex)
+                  const hasLast = !!lastSessions[ex]
+                  return (
+                    <button key={ex} onClick={()=>addExercise(ex)} className="px-3 py-1.5 rounded-xl text-xs font-medium transition-all border" style={added?{background:`${cfg.accent}22`,borderColor:`${cfg.accent}55`,color:cfg.accent}:{background:'rgba(255,255,255,0.03)',borderColor:'rgba(255,255,255,0.08)',color:hasLast?'rgba(255,255,255,0.7)':'rgba(255,255,255,0.4)'}}>
+                      {added?'✓ ':''}{ex}{hasLast?` (PR: ${lastSessions[ex].bestWeight}kg)`:''}
+                    </button>
+                  )
+                })}
+              </div>
+            </Card>
+
+            {exercises.map((ex,ei)=>{
+              const last = lastSessions[ex.name]
+              const isPR = newPRs.includes(ex.name)
+              return (
+                <Card key={ex.name}>
+                  <div className="flex justify-between mb-2">
+                    <div>
+                      <p className="font-bold text-white text-sm">{ex.name}</p>
+                      {last && <p className="text-xs mt-0.5" style={{color:cfg.accent}}>Previous best: {last.bestWeight}kg × {last.bestReps} reps — beat it!</p>}
+                      {isPR && <p className="text-yellow-400 text-xs">🏆 New PR this session!</p>}
+                    </div>
+                    <button onClick={()=>removeEx(ei)} className="text-zinc-600 hover:text-red-400 text-xl">×</button>
                   </div>
-                  <button onClick={()=>removeEx(ei)} className="text-zinc-600 hover:text-red-400 text-xl">×</button>
-                </div>
-                <div className="grid grid-cols-3 gap-2 text-xs text-zinc-600 mb-2 px-1"><span>Set</span><span>kg</span><span>Reps</span></div>
-                {ex.sets.map((s,si)=>(
-                  <div key={si} className="grid grid-cols-3 gap-2 mb-2">
-                    <span className="text-zinc-500 text-sm flex items-center pl-1">{si+1}</span>
-                   <input 
+                  <div className="grid grid-cols-3 gap-2 text-xs text-zinc-600 mb-2 px-1"><span>Set</span><span>kg</span><span>Reps</span></div>
+                  {ex.sets.map((s,si)=>(
+                    <div key={si} className="grid grid-cols-3 gap-2 mb-2">
+                      <span className="text-zinc-500 text-sm flex items-center pl-1">{si+1}</span>
+                      <input 
                         defaultValue={s.weight} 
-                        onBlur={e=>updateSet(ei,si,'weight',e.target.value)}  // Save when done typing
+                        onBlur={e=>updateSet(ei,si,'weight',e.target.value)}
                         type="number" 
                         placeholder="0" 
                         className="rounded-lg px-3 py-2 text-sm text-white text-center outline-none" 
                         style={{background:'rgba(255,255,255,0.06)',border:'1px solid rgba(255,255,255,0.1)'}}
                       />
-                   <input 
-  defaultValue={s.reps} 
-  onBlur={e=>updateSet(ei,si,'reps',e.target.value)} 
-  type="number" 
-  placeholder="0" 
-  className="rounded-lg px-3 py-2 text-sm text-white text-center outline-none" 
-  style={{background:'rgba(255,255,255,0.06)',border:'1px solid rgba(255,255,255,0.1)'}}
-/>
-                   </div>
-                ))}
-                <button onClick={()=>addSet(ei)} className="text-xs mt-1" style={{color:cfg.accent}}>+ Add set</button>
-              </Card>
-            )
-          })}
+                      <input 
+                        defaultValue={s.reps} 
+                        onBlur={e=>updateSet(ei,si,'reps',e.target.value)} 
+                        type="number" 
+                        placeholder="0" 
+                        className="rounded-lg px-3 py-2 text-sm text-white text-center outline-none" 
+                        style={{background:'rgba(255,255,255,0.06)',border:'1px solid rgba(255,255,255,0.1)'}}
+                      />
+                    </div>
+                  ))}
+                  <button onClick={()=>addSet(ei)} className="text-xs mt-1" style={{color:cfg.accent}}>+ Add set</button>
+                </Card>
+              )
+            })}
 
-          {exercises.length>0 && (
-            <Card>
-              <Label>RPE — Rate of Perceived Exertion</Label>
-              <div className="flex items-center gap-3 mb-2">
-                <span className="text-4xl font-black text-white">{rpe}</span>
-                <div>
-                  <p className="text-sm font-semibold" style={{color:rpe>=9?'#ef4444':rpe>=7?'#f97316':rpe>=5?'#f59e0b':'#10b981'}}>{rpe>=9?'Max effort':rpe>=7?'Hard':rpe>=5?'Moderate':'Easy'}</p>
-                  <p className="text-zinc-600 text-xs">out of 10</p>
-                </div>
-              </div>
-              <input type="range" min="1" max="10" value={rpe} onChange={e=>setRpe(+e.target.value)} className="w-full" style={{accentColor:cfg.accent}}/>
-            </Card>
-          )}
-        </>}
-
-        {/* SPORT */}
-        {type==='sport' && <>
-          <Card>
-            <Label>Performance rating</Label>
-            <div className="flex items-end gap-3 mb-3">
-              <span className="text-6xl font-black text-white">{performance}</span>
-              <div className="mb-2"><span className="text-lg font-bold" style={{color:perfColor}}>{perfLabel}</span><p className="text-zinc-600 text-xs">out of 10</p></div>
-            </div>
-            <input type="range" min="1" max="10" value={performance} onChange={e=>setPerformance(+e.target.value)} className="w-full mb-2" style={{accentColor:cfg.accent}}/>
-            <div className="flex justify-between text-xs text-zinc-700"><span>1</span><span>5</span><span>10</span></div>
-          </Card>
-          <Card>
-            <Label>What went well</Label>
-            <textarea value={wentWell} onChange={e=>setWentWell(e.target.value)} placeholder="Goals, good plays, wins..." rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
-          </Card>
-          <Card>
-            <Label>Areas to improve — tap to select</Label>
-            <div className="flex flex-wrap gap-2">
-              {missingOptions.map(x=><Pill key={x} label={(missing.includes(x)?'✗ ':'')+x} active={missing.includes(x)} onClick={()=>toggleMissing(x)} color="#ef4444"/>)}
-            </div>
-          </Card>
-
-          {/* Drill suggestions */}
-          {suggestedDrills.length>0 && (
-            <div className="rounded-2xl p-4 mb-4" style={{background:'linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.06))',border:'1px solid rgba(16,185,129,0.25)'}}>
-              <p className="text-emerald-400 text-xs uppercase tracking-widest mb-3">🎯 Recommended drills for next session</p>
-              {suggestedDrills.map(({area,drills})=>(
-                <div key={area} className="mb-4 last:mb-0">
-                  <p className="text-white text-xs font-bold mb-2 flex items-center gap-1"><span className="text-red-400">⚠</span> {area}</p>
-                  <div className="flex flex-col gap-1.5">
-                    {drills.slice(0,3).map((d,i)=>(
-                      <div key={i} className="flex items-start gap-2">
-                        <span className="text-emerald-500 text-xs mt-0.5 flex-shrink-0">→</span>
-                        <p className="text-zinc-300 text-xs">{d}</p>
-                      </div>
-                    ))}
+            {exercises.length>0 && (
+              <Card>
+                <Label>RPE — Rate of Perceived Exertion</Label>
+                <div className="flex items-center gap-3 mb-2">
+                  <span className="text-4xl font-black text-white">{rpe}</span>
+                  <div>
+                    <p className="text-sm font-semibold" style={{color:rpe>=9?'#ef4444':rpe>=7?'#f97316':rpe>=5?'#f59e0b':'#10b981'}}>{rpe>=9?'Max effort':rpe>=7?'Hard':rpe>=5?'Moderate':'Easy'}</p>
+                    <p className="text-zinc-600 text-xs">out of 10</p>
                   </div>
                 </div>
-              ))}
-            </div>
+                <input type="range" min="1" max="10" value={rpe} onChange={e=>setRpe(+e.target.value)} className="w-full" style={{accentColor:cfg.accent}}/>
+              </Card>
+            )}
+          </>}
+
+          {/* SPORT */}
+          {type==='sport' && <>
+            <Card>
+              <Label>Performance rating</Label>
+              <div className="flex items-end gap-3 mb-3">
+                <span className="text-6xl font-black text-white">{performance}</span>
+                <div className="mb-2"><span className="text-lg font-bold" style={{color:perfColor}}>{perfLabel}</span><p className="text-zinc-600 text-xs">out of 10</p></div>
+              </div>
+              <input type="range" min="1" max="10" value={performance} onChange={e=>setPerformance(+e.target.value)} className="w-full mb-2" style={{accentColor:cfg.accent}}/>
+              <div className="flex justify-between text-xs text-zinc-700"><span>1</span><span>5</span><span>10</span></div>
+            </Card>
+            <Card>
+              <Label>What went well</Label>
+              <textarea value={wentWell} onChange={e=>setWentWell(e.target.value)} placeholder="Goals, good plays, wins..." rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
+            </Card>
+            <Card>
+              <Label>Areas to improve — tap to select</Label>
+              <div className="flex flex-wrap gap-2">
+                {missingOptions.map(x=><Pill key={x} label={(missing.includes(x)?'✗ ':'')+x} active={missing.includes(x)} onClick={()=>toggleMissing(x)} color="#ef4444"/>)}
+              </div>
+            </Card>
+
+            {/* Drill suggestions */}
+            {suggestedDrills.length>0 && (
+              <div className="rounded-2xl p-4 mb-4" style={{background:'linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.06))',border:'1px solid rgba(16,185,129,0.25)'}}>
+                <p className="text-emerald-400 text-xs uppercase tracking-widest mb-3">🎯 Recommended drills for next session</p>
+                {suggestedDrills.map(({area,drills})=>(
+                  <div key={area} className="mb-4 last:mb-0">
+                    <p className="text-white text-xs font-bold mb-2 flex items-center gap-1"><span className="text-red-400">⚠</span> {area}</p>
+                    <div className="flex flex-col gap-1.5">
+                      {drills.slice(0,3).map((d,i)=>(
+                        <div key={i} className="flex items-start gap-2">
+                          <span className="text-emerald-500 text-xs mt-0.5 flex-shrink-0">→</span>
+                          <p className="text-zinc-300 text-xs">{d}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>}
+
+          {/* CARDIO */}
+          {type==='cardio' && (
+            <Card>
+              <Label>Session details</Label>
+              <div className="grid grid-cols-2 gap-3 mb-4">
+                <div><p className="text-zinc-500 text-xs mb-1.5">Duration (min)</p><input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="30" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/></div>
+                <div><p className="text-zinc-500 text-xs mb-1.5">Distance (km)</p><input value={distance} onChange={e=>setDistance(e.target.value)} type="number" placeholder="5" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/></div>
+              </div>
+            </Card>
           )}
-        </>}
 
-        {/* CARDIO */}
-        {type==='cardio' && (
+          {/* STEPS */}
+          {type==='steps' && (
+            <Card>
+              <Label>Steps today</Label>
+              <input value={steps} onChange={e=>setSteps(e.target.value)} type="number" placeholder="8000" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+              {steps && <div className="h-2 rounded-full overflow-hidden mt-3" style={{background:'rgba(255,255,255,0.06)'}}><div className="h-full rounded-full" style={{width:`${Math.min(100,(+steps/10000)*100)}%`,background:cfg.accent}}/></div>}
+              {steps && <p className="text-center text-xs mt-2" style={{color:+steps>=10000?'#10b981':'rgba(255,255,255,0.4)'}}>{+steps>=10000?'✅ Goal reached!':`${(10000-+steps).toLocaleString()} steps to go`}</p>}
+            </Card>
+          )}
+
+          {/* WATER */}
+          {type==='water' && (
+            <Card>
+              <Label>Glasses of water</Label>
+              <div className="flex items-center justify-center gap-6 py-4">
+                <button onClick={()=>setGlasses(Math.max(0,glasses-1))} className="w-12 h-12 rounded-full text-2xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
+                <div className="text-center"><span className="text-6xl font-black text-white">{glasses}</span><p className="text-zinc-500 text-xs mt-1">glasses</p></div>
+                <button onClick={()=>setGlasses(Math.min(20,glasses+1))} className="w-12 h-12 rounded-full text-2xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
+              </div>
+              <div className="flex gap-1.5 flex-wrap justify-center mt-2">
+                {Array.from({length:8}).map((_,i)=><div key={i} className="text-2xl transition-all" style={{opacity:i<glasses?1:0.15}}>💧</div>)}
+              </div>
+              <p className="text-center text-xs mt-3" style={{color:glasses>=8?'#10b981':'rgba(255,255,255,0.3)'}}>{glasses>=8?'✅ Daily goal reached!!':`${8-glasses} more to hit goal`}</p>
+            </Card>
+          )}
+
+          {/* SLEEP */}
+          {type==='sleep' && (
+            <Card>
+              <Label>Hours slept</Label>
+              <div className="flex items-center justify-center gap-6 py-2 mb-4">
+                <button onClick={()=>setHours(Math.max(0,hours-.5))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
+                <div className="text-center"><span className="text-6xl font-black text-white">{hours}</span><p className="text-zinc-500 text-xs mt-1">hours</p></div>
+                <button onClick={()=>setHours(Math.min(12,hours+.5))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
+              </div>
+              <Label>Sleep quality</Label>
+              <div className="flex gap-2 flex-wrap">
+                {['😴 Terrible','😔 Poor','😐 OK','🙂 Good','😊 Great'].map((q,i)=><Pill key={q} label={q} active={sleepQuality===i} onClick={()=>setSleepQuality(i)}/>)}
+              </div>
+            </Card>
+          )}
+
+          {/* READING */}
+          {type==='reading' && (
+            <Card>
+              <Label>Pages read</Label>
+              <input value={pages} onChange={e=>setPages(e.target.value)} type="number" placeholder="20" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold mb-4" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+              <Label>Genre</Label>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {GENRES.map(g=><Pill key={g} label={g} active={genre===g} onClick={()=>setGenre(g)}/>)}
+              </div>
+              <Label>Session rating</Label>
+              <div className="flex items-center gap-2 py-2">
+                {[1,2,3,4,5].map(star=>(
+                  <button key={star} onClick={()=>setSessionRating(star)} className="text-3xl transition-all hover:scale-110 active:scale-95" style={{color:star<=sessionRating?'#f59e0b':'rgba(255,255,255,0.1)',filter:star<=sessionRating?'drop-shadow(0 0 6px #f59e0b88)':'none'}}>★</button>
+                ))}
+                <span className="text-sm ml-2" style={{color:sessionRating>=4?'#f59e0b':'rgba(255,255,255,0.3)'}}>{['','Weak','OK','Good','Great','Excellent'][sessionRating]}</span>
+              </div>
+            </Card>
+          )}
+
+          {/* YOGA */}
+          {type==='yoga' && (
+            <Card>
+              <Label>Yoga style</Label>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {YOGA_TYPES.map(y=><Pill key={y} label={y} active={yogaType===y} onClick={()=>setYogaType(y)}/>)}
+              </div>
+            </Card>
+          )}
+
+          {/* MEDITATION */}
+          {type==='meditation' && (
+            <Card>
+              <Label>Duration (minutes)</Label>
+              <input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="10" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+            </Card>
+          )}
+
+          {/* JOURNAL */}
+          {type==='journal' && (
+            <Card>
+              <Label>3 things I'm grateful for</Label>
+              <textarea value={gratitude} onChange={e=>setGratitude(e.target.value)} placeholder="1. &#10;2. &#10;3. " rows={5} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
+            </Card>
+          )}
+
+          {/* NUTRITION */}
+          {type==='nutrition' && (
+            <Card>
+              <Label>Meals today</Label>
+              <div className="flex items-center justify-center gap-6 py-2 mb-4">
+                <button onClick={()=>setMeals(Math.max(0,meals-1))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
+                <div className="text-center"><span className="text-5xl font-black text-white">{meals}</span><p className="text-zinc-500 text-xs mt-1">meals</p></div>
+                <button onClick={()=>setMeals(Math.min(8,meals+1))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
+              </div>
+              <Label>Calories (optional)</Label>
+              <input value={calories} onChange={e=>setCalories(e.target.value)} type="number" placeholder="2000" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+            </Card>
+          )}
+
+          {/* LEARNING / LANGUAGE */}
+          {type==='learning' && (
+            <Card>
+              <Label>Language</Label>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {LANGUAGES.map(l=><Pill key={l} label={l} active={language===l} onClick={()=>setLanguage(l)}/>)}
+              </div>
+              <Label>Session rating</Label>
+              <div className="flex items-center gap-2 py-2 mb-4">
+                {[1,2,3,4,5].map(star=>(
+                  <button key={star} onClick={()=>setSessionRating(star)} className="text-3xl transition-all hover:scale-110 active:scale-95" style={{color:star<=sessionRating?'#f59e0b':'rgba(255,255,255,0.1)',filter:star<=sessionRating?'drop-shadow(0 0 6px #f59e0b88)':'none'}}>★</button>
+                ))}
+                <span className="text-sm ml-2" style={{color:sessionRating>=4?'#f59e0b':'rgba(255,255,255,0.3)'}}>{['','Weak','OK','Good','Great','Excellent'][sessionRating]}</span>
+              </div>
+              <Label>Duration (minutes)</Label>
+              <input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="30" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+            </Card>
+          )}
+
+          {/* FOCUS */}
+          {type==='focus' && (
+            <Card>
+              <Label>Duration (minutes)</Label>
+              <input value={focusDuration} onChange={e=>setFocusDuration(e.target.value)} type="number" placeholder="90" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold mb-4" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
+              <Label>Tasks completed</Label>
+              <textarea value={tasks} onChange={e=>setTasks(e.target.value)} placeholder="What did you get done?" rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
+            </Card>
+          )}
+
+          {/* Mood */}
+          {cfg.sections.includes('mood') && (
+            <Card>
+              <Label>Mood</Label>
+              <div className="flex gap-2 flex-wrap">
+                {MOODS.map((m,i)=><Pill key={m} label={m} active={mood===i} onClick={()=>setMood(i)}/>)}
+              </div>
+            </Card>
+          )}
+
+          {/* Energy */}
+          {cfg.sections.includes('energy') && (
+            <Card>
+              <Label>Energy level</Label>
+              <div className="flex gap-2 flex-wrap">
+                {ENERGY.map((e,i)=><Pill key={e} label={e} active={energy===i} onClick={()=>setEnergy(i)}/>)}
+              </div>
+            </Card>
+          )}
+
+          {/* Notes */}
           <Card>
-            <Label>Session details</Label>
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              <div><p className="text-zinc-500 text-xs mb-1.5">Duration (min)</p><input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="30" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/></div>
-              <div><p className="text-zinc-500 text-xs mb-1.5">Distance (km)</p><input value={distance} onChange={e=>setDistance(e.target.value)} type="number" placeholder="5" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/></div>
-            </div>
+            <Label>Notes (optional)</Label>
+            <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Anything else..." rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
           </Card>
-        )}
 
-        {/* STEPS */}
-        {type==='steps' && (
-          <Card>
-            <Label>Steps today</Label>
-            <input value={steps} onChange={e=>setSteps(e.target.value)} type="number" placeholder="8000" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-            {steps && <div className="h-2 rounded-full overflow-hidden mt-3" style={{background:'rgba(255,255,255,0.06)'}}><div className="h-full rounded-full" style={{width:`${Math.min(100,(+steps/10000)*100)}%`,background:cfg.accent}}/></div>}
-            {steps && <p className="text-center text-xs mt-2" style={{color:+steps>=10000?'#10b981':'rgba(255,255,255,0.4)'}}>{+steps>=10000?'✅ Goal reached!':`${(10000-+steps).toLocaleString()} steps to go`}</p>}
-          </Card>
-        )}
-
-        {/* WATER */}
-        {type==='water' && (
-          <Card>
-            <Label>Glasses of water</Label>
-            <div className="flex items-center justify-center gap-6 py-4">
-              <button onClick={()=>setGlasses(Math.max(0,glasses-1))} className="w-12 h-12 rounded-full text-2xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
-              <div className="text-center"><span className="text-6xl font-black text-white">{glasses}</span><p className="text-zinc-500 text-xs mt-1">glasses</p></div>
-              <button onClick={()=>setGlasses(Math.min(20,glasses+1))} className="w-12 h-12 rounded-full text-2xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
-            </div>
-            <div className="flex gap-1.5 flex-wrap justify-center mt-2">
-              {Array.from({length:8}).map((_,i)=><div key={i} className="text-2xl transition-all" style={{opacity:i<glasses?1:0.15}}>💧</div>)}
-            </div>
-            <p className="text-center text-xs mt-3" style={{color:glasses>=8?'#10b981':'rgba(255,255,255,0.3)'}}>{glasses>=8?'✅ Daily goal reached!!':`${8-glasses} more to hit goal`}</p>
-          </Card>
-        )}
-
-        {/* SLEEP */}
-        {type==='sleep' && (
-          <Card>
-            <Label>Hours slept</Label>
-            <div className="flex items-center justify-center gap-6 py-2 mb-4">
-              <button onClick={()=>setHours(Math.max(0,hours-.5))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
-              <div className="text-center"><span className="text-6xl font-black text-white">{hours}</span><p className="text-zinc-500 text-xs mt-1">hours</p></div>
-              <button onClick={()=>setHours(Math.min(12,hours+.5))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
-            </div>
-            <Label>Sleep quality</Label>
-            <div className="flex gap-2 flex-wrap">
-              {['😴 Terrible','😔 Poor','😐 OK','🙂 Good','😊 Great'].map((q,i)=><Pill key={q} label={q} active={sleepQuality===i} onClick={()=>setSleepQuality(i)}/>)}
-            </div>
-          </Card>
-        )}
-
-        {/* READING */}
-        {type==='reading' && (
-          <Card>
-            <Label>Pages read</Label>
-            <input value={pages} onChange={e=>setPages(e.target.value)} type="number" placeholder="20" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold mb-4" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-            <Label>Genre</Label>
-            <div className="flex flex-wrap gap-2 mb-4">
-              {GENRES.map(g=><Pill key={g} label={g} active={genre===g} onClick={()=>setGenre(g)}/>)}
-            </div>
-            <Label>Session rating</Label>
-            <div className="flex items-center gap-2 py-2">
-              {[1,2,3,4,5].map(star=>(
-                <button key={star} onClick={()=>setSessionRating(star)} className="text-3xl transition-all hover:scale-110 active:scale-95" style={{color:star<=sessionRating?'#f59e0b':'rgba(255,255,255,0.1)',filter:star<=sessionRating?'drop-shadow(0 0 6px #f59e0b88)':'none'}}>★</button>
-              ))}
-              <span className="text-sm ml-2" style={{color:sessionRating>=4?'#f59e0b':'rgba(255,255,255,0.3)'}}>{['','Weak','OK','Good','Great','Excellent'][sessionRating]}</span>
-            </div>
-          </Card>
-        )}
-
-        {/* YOGA */}
-        {type==='yoga' && (
-          <Card>
-            <Label>Yoga style</Label>
-            <div className="flex flex-wrap gap-2 mb-4">
-              {YOGA_TYPES.map(y=><Pill key={y} label={y} active={yogaType===y} onClick={()=>setYogaType(y)}/>)}
-            </div>
-          </Card>
-        )}
-
-        {/* MEDITATION */}
-        {type==='meditation' && (
-          <Card>
-            <Label>Duration (minutes)</Label>
-            <input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="10" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-          </Card>
-        )}
-
-        {/* JOURNAL */}
-        {type==='journal' && (
-          <Card>
-            <Label>3 things I'm grateful for</Label>
-            <textarea value={gratitude} onChange={e=>setGratitude(e.target.value)} placeholder="1. &#10;2. &#10;3. " rows={5} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
-          </Card>
-        )}
-
-        {/* NUTRITION */}
-        {type==='nutrition' && (
-          <Card>
-            <Label>Meals today</Label>
-            <div className="flex items-center justify-center gap-6 py-2 mb-4">
-              <button onClick={()=>setMeals(Math.max(0,meals-1))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>−</button>
-              <div className="text-center"><span className="text-5xl font-black text-white">{meals}</span><p className="text-zinc-500 text-xs mt-1">meals</p></div>
-              <button onClick={()=>setMeals(Math.min(8,meals+1))} className="w-12 h-12 rounded-full text-xl font-bold text-white flex items-center justify-center" style={{background:'rgba(255,255,255,0.07)'}}>+</button>
-            </div>
-            <Label>Calories (optional)</Label>
-            <input value={calories} onChange={e=>setCalories(e.target.value)} type="number" placeholder="2000" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-          </Card>
-        )}
-
-        {/* LEARNING / LANGUAGE */}
-        {type==='learning' && (
-          <Card>
-            <Label>Language</Label>
-            <div className="flex flex-wrap gap-2 mb-4">
-              {LANGUAGES.map(l=><Pill key={l} label={l} active={language===l} onClick={()=>setLanguage(l)}/>)}
-            </div>
-            <Label>Session rating</Label>
-            <div className="flex items-center gap-2 py-2 mb-4">
-              {[1,2,3,4,5].map(star=>(
-                <button key={star} onClick={()=>setSessionRating(star)} className="text-3xl transition-all hover:scale-110 active:scale-95" style={{color:star<=sessionRating?'#f59e0b':'rgba(255,255,255,0.1)',filter:star<=sessionRating?'drop-shadow(0 0 6px #f59e0b88)':'none'}}>★</button>
-              ))}
-              <span className="text-sm ml-2" style={{color:sessionRating>=4?'#f59e0b':'rgba(255,255,255,0.3)'}}>{['','Weak','OK','Good','Great','Excellent'][sessionRating]}</span>
-            </div>
-            <Label>Duration (minutes)</Label>
-            <input value={duration} onChange={e=>setDuration(e.target.value)} type="number" placeholder="30" className="w-full rounded-xl px-4 py-3 text-sm text-white outline-none text-center" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-          </Card>
-        )}
-
-        {/* FOCUS */}
-        {type==='focus' && (
-          <Card>
-            <Label>Duration (minutes)</Label>
-            <input value={focusDuration} onChange={e=>setFocusDuration(e.target.value)} type="number" placeholder="90" className="w-full rounded-xl px-4 py-4 text-2xl text-white outline-none text-center font-bold mb-4" style={{background:'rgba(255,255,255,0.05)',border:'1px solid rgba(255,255,255,0.08)'}}/>
-            <Label>Tasks completed</Label>
-            <textarea value={tasks} onChange={e=>setTasks(e.target.value)} placeholder="What did you get done?" rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
-          </Card>
-        )}
-
-        {/* Mood */}
-        {cfg.sections.includes('mood') && (
-          <Card>
-            <Label>Mood</Label>
-            <div className="flex gap-2 flex-wrap">
-              {MOODS.map((m,i)=><Pill key={m} label={m} active={mood===i} onClick={()=>setMood(i)}/>)}
-            </div>
-          </Card>
-        )}
-
-        {/* Energy */}
-        {cfg.sections.includes('energy') && (
-          <Card>
-            <Label>Energy level</Label>
-            <div className="flex gap-2 flex-wrap">
-              {ENERGY.map((e,i)=><Pill key={e} label={e} active={energy===i} onClick={()=>setEnergy(i)}/>)}
-            </div>
-          </Card>
-        )}
-
-        {/* Notes */}
-        <Card>
-          <Label>Notes (optional)</Label>
-          <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Anything else..." rows={3} className="w-full rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-700 outline-none resize-none" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.07)'}}/>
-        </Card>
-
-        <button onClick={save} disabled={saving} className="w-full py-4 rounded-2xl font-bold text-white text-sm transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 mt-2" style={{background:`linear-gradient(135deg,${cfg.accent},${cfg.accent}99)`,boxShadow:`0 6px 24px ${cfg.accent}44`}}>
-          {saving?'Saving...':`${cfg.icon} Save ${cfg.title}`}
-        </button>
+          <button onClick={save} disabled={saving} className="w-full py-4 rounded-2xl font-bold text-white text-sm transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 mt-2" style={{background:`linear-gradient(135deg,${cfg.accent},${cfg.accent}99)`,boxShadow:`0 6px 24px ${cfg.accent}44`}}>
+            {saving?'Saving...':`${cfg.icon} Save ${cfg.title}`}
+          </button>
+        </div>
       </div>
-    </div>
-      </PageContainer>
+    </PageContainer>
   )
 }
 
